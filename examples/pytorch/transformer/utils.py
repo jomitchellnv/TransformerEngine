@@ -1,3 +1,9 @@
+# Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# See LICENSE for license information.
+
+"""Utils for context parallel integration testing."""
+
 import torch
 from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import pad_sequences_to_divisibility
 import torch.distributed as dist
