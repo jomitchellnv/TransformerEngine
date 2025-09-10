@@ -6,7 +6,7 @@
 from utils import get_dummy_data_bshd, collect_gradients, DistributedConfig
 from model import SimpleConfig, SimpleBSHDModel
 
-from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import get_thd_batch_on_this_cp_rank
+from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import get_batch_on_this_cp_rank
 import random
 import numpy as np
 import torch
@@ -220,17 +220,32 @@ if DISTRIBUTED_MODE:
         torch.cuda.manual_seed(42)
 
     batch = get_dummy_data_bshd()
-    
-    import sys; sys.exit(0)
+    print("before moving data to cp shards...")
+    print(f"on rank {dist_config.rank} input_ids_padded shape is {batch['input_ids'].shape}")
+    print(f"on rank {dist_config.rank} labels_padded shape is {batch['labels'].shape}")
+    print(f"on rank {dist_config.rank} position_ids_padded shape is {batch['position_ids'].shape}")
+    print(f"input ids device is {batch['input_ids'].device}")
+    print(f"labels device is {batch['labels'].device}")
+    print(f"position_ids device is {batch['position_ids'].device}")
     # TODO: Try the version of this that uses BSHD instead of the THD version.
-    input_ids_padded, labels_padded, position_ids_padded = get_thd_batch_on_this_cp_rank(
-            batch['cu_seqlens_q_padded'], batch['cu_seqlens_kv_padded'], batch['input_ids_padded'], batch['labels_padded'], batch['position_ids_padded'], 
-            cp_group
-        )
+    input_ids, labels, position_ids = get_batch_on_this_cp_rank(
+        cu_seqlens_padded=batch['cu_seqlens_q'],
+        input_ids_padded=batch['input_ids'],
+        labels_padded=batch['labels'],
+        position_ids_padded=batch['position_ids'],
+        cp_group=cp_group,
+        qvk_format="bshd"
+    )
+    print("after moving data to cp shards...")
+    print(f"after on rank {dist_config.rank} input_ids shape is {input_ids.shape}")
+    print(f"after on rank {dist_config.rank} labels shape is {labels.shape}")
+    print(f"after on rank {dist_config.rank} position_ids shape is {position_ids.shape}")
 
-    batch['input_ids'] = input_ids_padded
-    batch['labels'] = labels_padded
-    batch['position_ids'] = position_ids_padded
+    
+    # TODO: Add them back to batch.
+    batch['input_ids'] = input_ids
+    batch['labels'] = labels
+    batch['position_ids'] = position_ids
     
     batch = {k: v.to(device, non_blocking=True).contiguous() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
     
@@ -239,7 +254,6 @@ if DISTRIBUTED_MODE:
     print(f"  input_ids shape: {batch['input_ids'].shape if 'input_ids' in batch else 'N/A'}")
     print(f"  labels shape: {batch['labels'].shape if 'labels' in batch else 'N/A'}")
     print(f"  cu_seqlens_q: {batch['cu_seqlens_q']}")
-    print(f"  cu_seqlens_q_padded: {batch['cu_seqlens_q_padded']}")
 
     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
         output = model(batch)

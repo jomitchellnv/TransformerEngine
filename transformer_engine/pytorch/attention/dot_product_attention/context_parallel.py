@@ -4060,11 +4060,11 @@ def get_batch_on_this_cp_rank(
     """
     if qvk_format not in ["thd", "bshd", "sbhd"]:
         raise ValueError(f"Unsupported qvk_format: {qvk_format}!")
+    cp_size = torch.distributed.get_world_size(group=cp_group)
+    cp_rank = torch.distributed.get_rank(group=cp_group)
     if qvk_format == "thd":
         # Get context parallel size and rank
-        cp_size = torch.distributed.get_world_size(group=cp_group)
         if cp_size > 1:
-            cp_rank = torch.distributed.get_rank(group=cp_group)
 
             # Calculate the chunk sizes for each sequence
             total_slices_of_any_sequence = 2 * cp_size
@@ -4132,6 +4132,28 @@ def get_batch_on_this_cp_rank(
             input_ids_padded = process_tensor(input_ids_padded)
             labels_padded = process_tensor(labels_padded)
             position_ids_padded = process_tensor(position_ids_padded)
+    elif qvk_format == "bshd":
+        def process_tensor(val):
+            if val is None:
+                return val
+            seq_dim = 1 # TODO: Add some better handling of the seq dimensions.
+            val = val.view(
+                *val.shape[0:seq_dim],
+                2 * cp_size,
+                val.shape[seq_dim] // (2 * cp_size),
+                *val.shape[(seq_dim + 1) :],
+            )
+            index = torch.tensor(
+                [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
+            )
+            val = val.index_select(seq_dim, index)
+            val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
+            return val
+        if cp_size > 1:
+            input_ids_padded = process_tensor(input_ids_padded)
+            labels_padded = process_tensor(labels_padded)
+            position_ids_padded = process_tensor(position_ids_padded)
+        
     else:
         raise ValueError(f"Support not implemented yet for qvk_format: {qvk_format}!")
 

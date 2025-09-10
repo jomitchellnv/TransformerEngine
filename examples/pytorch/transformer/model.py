@@ -119,7 +119,7 @@ class SimpleBSHDModel(torch.nn.Module):
                 qkv_weight_interleaved=True,
                 layer_number=i + 1,
                 layer_type="encoder",
-                self_attn_mask_type="padding",
+                self_attn_mask_type="no_mask",
                 activation="gelu",
                 attn_input_format="bshd",
                 seq_length=config.max_seq_length,
