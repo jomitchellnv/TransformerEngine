@@ -6,7 +6,7 @@
 from utils import get_dummy_data_thd, collect_gradients, DistributedConfig
 from model import SimpleConfig, SimpleThDModel
 
-from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import get_thd_batch_on_this_cp_rank
+from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import get_batch_on_this_cp_rank
 import random
 import numpy as np
 import torch
@@ -103,7 +103,7 @@ print(f"CP=1 collected {len(grads_cp1)} parameter gradients")
 
 # Save the model state for reuse in CP=2 (no distributed checks needed)
 initial_state_dict = {k: v.cpu().clone() for k, v in model_cp1.state_dict().items()}
-torch.save(initial_state_dict, '/tmp/initial_model_state.pt')
+torch.save(initial_state_dict, '/tmp/thd_initial_model_state.pt')
 print("Model state saved for CP=2 reuse")
 
 # Store CP=1 results (only what we need to test)
@@ -114,8 +114,8 @@ cp1_results = {
     'grads': grads_cp1,
 }
 
-torch.save(cp1_results, '/tmp/cp1_results.pt')
-torch.save(data, '/tmp/data.pt')
+torch.save(cp1_results, '/tmp/thd_cp1_results.pt')
+torch.save(data, '/tmp/thd_data.pt')
 print(f"CP=1 results: logits {cp1_results['logits'].shape}, loss {cp1_results['loss'].item():.6f}, {len(cp1_results['grad_norms'])} grad norms")
 
 # No process group to destroy for CP=1 (single GPU run)
@@ -175,7 +175,7 @@ if DISTRIBUTED_MODE:
     # Load the same initial state dict from CP=1 run
     print("Loading saved model state...")
     try:
-        initial_state_dict = torch.load('/tmp/initial_model_state.pt', map_location='cpu')
+        initial_state_dict = torch.load('/tmp/thd_initial_model_state.pt', map_location='cpu')
         model.load_state_dict(initial_state_dict)
         print(f"Rank {dist_config.rank}: Model state loaded successfully")
     except Exception as e:
@@ -224,10 +224,15 @@ if DISTRIBUTED_MODE:
 
     batch = get_dummy_data_thd()
     
-    input_ids_padded, labels_padded, position_ids_padded = get_thd_batch_on_this_cp_rank(
-            batch['cu_seqlens_q_padded'], batch['cu_seqlens_kv_padded'], batch['input_ids_padded'], batch['labels_padded'], batch['position_ids_padded'], 
-            cp_group
-        )
+    input_ids_padded, labels_padded, position_ids_padded = get_batch_on_this_cp_rank(
+        cu_seqlens_padded=batch['cu_seqlens_q_padded'],
+        input_ids_padded=batch['input_ids_padded'],
+        labels_padded=batch['labels_padded'],
+        position_ids_padded=batch['position_ids_padded'],
+        cp_group=cp_group,
+        qvk_format="thd"
+    )
+    
 
     batch['input_ids'] = input_ids_padded
     batch['labels'] = labels_padded
@@ -273,7 +278,7 @@ if DISTRIBUTED_MODE:
     print(f"Rank {dist_config.rank}: CP=2 results: logits {cp2_results['logits'].shape}, loss {cp2_results['loss'].item():.6f}, {len(cp2_results['grad_norms'])} grad norms")
 
     # I want to save the CP2 rank0 and CP2 rank 1 results to a file.
-    torch.save(cp2_results, f'/tmp/cp2_rank_{dist_config.rank}_results.pt')
+    torch.save(cp2_results, f'/tmp/thd_cp2_rank_{dist_config.rank}_results.pt')
     dist.barrier()
     print("Done saving CP=2 results")
     # Clean up CP=2

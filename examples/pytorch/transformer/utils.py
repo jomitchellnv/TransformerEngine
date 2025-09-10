@@ -5,7 +5,7 @@
 """Utils for context parallel integration testing."""
 
 import torch
-from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import pad_sequences_to_divisibility
+from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import pad_thd_sequences_for_cp, generate_positional_ids_for_cp
 import torch.distributed as dist
 import os
 from dataclasses import dataclass, field
@@ -112,16 +112,16 @@ def get_dummy_data_thd():
     cp_size=2
     divisibility_factor = 2 * cp_size
 
-    input_ids_padded, labels_padded, _, positional_ids_padded, cu_seqlens_q_padded = \
-                pad_sequences_to_divisibility(
+    input_ids_padded, labels_padded, cu_seqlens_q_padded = \
+                pad_thd_sequences_for_cp(
                     input_ids.unsqueeze(0),
                     labels.unsqueeze(0),
-                    positional_ids,
                     cu_seqlens_q,
                     divisibility_factor,
                     padding_token_id=pid,
                     padding_label_id=label_pad
                 )
+    positional_ids_padded = generate_positional_ids_for_cp(cu_seqlens_q_padded, divisibility_factor=divisibility_factor)
     expected_input_ids = torch.tensor([
                 1, 1, 1, 1, 1, 1, 1, pid,
                 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, pid,

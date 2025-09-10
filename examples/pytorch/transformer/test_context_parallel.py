@@ -136,10 +136,10 @@ def load_test_data():
     """Load saved results from CP=1 and CP=2 runs."""
     # Check if test data files exist
     required_files = [
-        '/tmp/cp2_rank_0_results.pt',
-        '/tmp/cp2_rank_1_results.pt', 
-        '/tmp/cp1_results.pt',
-        '/tmp/data.pt'
+        '/tmp/thd_cp2_rank_0_results.pt',
+        '/tmp/thd_cp2_rank_1_results.pt', 
+        '/tmp/thd_cp1_results.pt',
+        '/tmp/thd_data.pt'
     ]
     
     for file_path in required_files:
@@ -147,10 +147,10 @@ def load_test_data():
             pytest.skip(f"Required test data file not found: {file_path}. Run the distributed test first.")
     
     # Load all test data
-    cp2_rank0_results = torch.load('/tmp/cp2_rank_0_results.pt')
-    cp2_rank1_results = torch.load('/tmp/cp2_rank_1_results.pt')
-    cp1_results = torch.load('/tmp/cp1_results.pt')
-    data = torch.load('/tmp/data.pt')
+    cp2_rank0_results = torch.load('/tmp/thd_cp2_rank_0_results.pt')
+    cp2_rank1_results = torch.load('/tmp/thd_cp2_rank_1_results.pt')
+    cp1_results = torch.load('/tmp/thd_cp1_results.pt')
+    data = torch.load('/tmp/thd_data.pt')
     
     return {
         'cp2_rank0_results': cp2_rank0_results,
