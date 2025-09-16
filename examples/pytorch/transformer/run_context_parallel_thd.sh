@@ -1,5 +1,5 @@
 #!/bin/bash
-torchrun --nproc_per_node=2 --master_port=29501 context_parallel_runner_thd.py
+torchrun --nproc_per_node=2 context_parallel_runner_thd.py
 
 
 # Run pytest on the context parallel tests
@@ -10,8 +10,8 @@ cd "$(dirname "$0")"
 
 # Check if test data exists
 if [ ! -f "/tmp/thd_cp1_results.pt" ] || [ ! -f "/tmp/thd_cp2_rank_0_results.pt" ] || [ ! -f "/tmp/thd_cp2_rank_1_results.pt" ] || [ ! -f "/tmp/thd_data.pt" ]; then
-    echo "❌ Test data not found. Please run the distributed test first:"
-    echo "   bash run_context_parallel_thd.sh"
+    echo "❌ Test data not found. Please run the distributed runner first:"
+    echo "   torchrun --nproc_per_node=2 --master_port=29501 context_parallel_runner_thd.py"
     exit 1
 fi
 

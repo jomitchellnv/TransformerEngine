@@ -114,7 +114,7 @@ logger.info("CP=1 baseline completed successfully")
 if not DISTRIBUTED_MODE:
     logger.info("="*50)
     logger.info("SKIPPING CP=2 - Not running in distributed mode")
-    logger.info("To test CP=2, run with: torchrun --nproc_per_node=2 test_lightweight_integration.py")
+    logger.info("To test CP=2, run with: torchrun --nproc_per_node=2 run_context_parallel_thd.py")
     logger.info("="*50)
     import sys
     sys.exit(1)
