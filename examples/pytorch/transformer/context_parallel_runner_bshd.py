@@ -45,7 +45,7 @@ torch.cuda.set_device(0)
 config = SimpleConfig(
     micro_batch_size=1,
     max_seq_length=1024,
-    num_hidden_layers=2,
+    num_hidden_layers=1,
     vocab_size=33,
     hidden_size=320,
     intermediate_size=1280,

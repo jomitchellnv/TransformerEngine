@@ -37,19 +37,19 @@ def get_dummy_data_bshd():
     
     # Create 3 separate sequences with different lengths, each padded to max_seq_length
     # Sequence 1: 7 tokens, padded to 12
-    seq1_input_ids = [1, 1, 1, 1, 1, 1, 1] + [pid] * 5
-    seq1_labels = [10, 11, 12, 13, 14, 15, 16] + [label_pad] * 5
-    seq1_position_ids = list(range(7)) + [0] * 5  # Position IDs only for real tokens
+    seq1_input_ids = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    seq1_labels = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+    seq1_position_ids = list(range(12))
     
     # Sequence 2: 11 tokens, padded to 12
-    seq2_input_ids = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2] + [pid] * 1
-    seq2_labels = [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30] + [label_pad] * 1
-    seq2_position_ids = list(range(11)) + [0] * 1
+    seq2_input_ids = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    seq2_labels = [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+    seq2_position_ids = list(range(12))
     
     # Sequence 3: 5 tokens, padded to 12
-    seq3_input_ids = [3, 3, 3, 3, 3] + [pid] * 7
-    seq3_labels = [5, 6, 7, 8, 9] + [label_pad] * 7
-    seq3_position_ids = list(range(5)) + [0] * 7
+    seq3_input_ids = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+    seq3_labels = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    seq3_position_ids = list(range(12))
     
     # Stack into batch tensors [batch_size, seq_length]
     input_ids_2d = torch.tensor([
