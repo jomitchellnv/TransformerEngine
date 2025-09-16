@@ -2,6 +2,7 @@
 import torch
 import pytest
 import os
+import logging
 
 # Test tolerance constants - adjust these to tune test sensitivity
 LOGITS_ACCURACY_THRESHOLD = 85.0  # Percentage of elements within 2e-2 tolerance
@@ -49,11 +50,12 @@ def calculate_cp_indices_bshd(batch_size, seq_len, cp_size=2):
         # So rank 0 gets [chunk_0_data, chunk_3_data] as a contiguous tensor
         rank_indices[cp_rank] = list(range(start_pos_1, end_pos_1)) + list(range(start_pos_2, end_pos_2))
     
-    print(f"🔍 CP indices calculation debug:")
-    print(f"  seq_len={seq_len}, cp_size={cp_size}, slice_size={slice_size}")
+    logger = logging.getLogger(__name__)
+    logger.debug("CP indices calculation debug:")
+    logger.debug(f"  seq_len={seq_len}, cp_size={cp_size}, slice_size={slice_size}")
     for rank in range(cp_size):
         chunks = [cp_rank, (2 * cp_size - cp_rank - 1)] if cp_rank == rank else [rank, (2 * cp_size - rank - 1)]
-        print(f"  Rank {rank}: chunks {chunks} → positions {rank_indices[rank][:10]}...{rank_indices[rank][-10:]} (total: {len(rank_indices[rank])})")
+        logger.debug(f"  Rank {rank}: chunks {chunks} → positions {rank_indices[rank][:10]}...{rank_indices[rank][-10:]} (total: {len(rank_indices[rank])})")
     
     return rank_indices
 
@@ -73,8 +75,9 @@ def reconstruct_cp_logits_bshd(cp2_rank0_logits, cp2_rank1_logits, cp1_baseline_
     Returns:
         torch.Tensor: Reconstructed full sequence logits [batch_size, seq_len, vocab_size]
     """
-    print(f"🔄 Reconstructing CP={cp_size} BSHD logits from 2 ranks")
-    print(f"  Input shapes: rank0={cp2_rank0_logits.shape}, rank1={cp2_rank1_logits.shape}, baseline={cp1_baseline_logits.shape}")
+    logger = logging.getLogger(__name__)
+    logger.info(f"Reconstructing CP={cp_size} BSHD logits from 2 ranks")
+    logger.info(f"  Input shapes: rank0={cp2_rank0_logits.shape}, rank1={cp2_rank1_logits.shape}, baseline={cp1_baseline_logits.shape}")
     
     batch_size, full_seq_len, vocab_size = cp1_baseline_logits.shape
     
@@ -84,21 +87,21 @@ def reconstruct_cp_logits_bshd(cp2_rank0_logits, cp2_rank1_logits, cp1_baseline_
     
     expected_rank_seq_len = 2 * chunk_size  # Each rank gets 2 chunks
     
-    print(f"  Expected seq lengths per rank: {expected_rank_seq_len}")
-    print(f"  Actual seq lengths - rank0: {cp2_rank0_logits.shape[1]}, rank1: {cp2_rank1_logits.shape[1]}")
+    logger.info(f"  Expected seq lengths per rank: {expected_rank_seq_len}")
+    logger.info(f"  Actual seq lengths - rank0: {cp2_rank0_logits.shape[1]}, rank1: {cp2_rank1_logits.shape[1]}")
     
     # Verify sizes match expectations
     if expected_rank_seq_len != cp2_rank0_logits.shape[1]:
-        print(f"    ❌ Rank 0 seq length mismatch: expected {expected_rank_seq_len}, got {cp2_rank0_logits.shape[1]}")
+        logger.error(f"Rank 0 seq length mismatch: expected {expected_rank_seq_len}, got {cp2_rank0_logits.shape[1]}")
         return None
         
     if expected_rank_seq_len != cp2_rank1_logits.shape[1]:
-        print(f"    ❌ Rank 1 seq length mismatch: expected {expected_rank_seq_len}, got {cp2_rank1_logits.shape[1]}")
+        logger.error(f"Rank 1 seq length mismatch: expected {expected_rank_seq_len}, got {cp2_rank1_logits.shape[1]}")
         return None
     
     # Verify batch sizes match
     if cp2_rank0_logits.shape[0] != batch_size or cp2_rank1_logits.shape[0] != batch_size:
-        print(f"    ❌ Batch size mismatch: expected {batch_size}, got rank0={cp2_rank0_logits.shape[0]}, rank1={cp2_rank1_logits.shape[0]}")
+        logger.error(f"Batch size mismatch: expected {batch_size}, got rank0={cp2_rank0_logits.shape[0]}, rank1={cp2_rank1_logits.shape[0]}")
         return None
     
     # Reconstruct full logits
@@ -115,7 +118,7 @@ def reconstruct_cp_logits_bshd(cp2_rank0_logits, cp2_rank1_logits, cp1_baseline_
     reconstructed_logits[:, chunk_0_start:chunk_0_end, :] = cp2_rank0_logits[:, :chunk_size, :]
     reconstructed_logits[:, chunk_3_start:chunk_3_end, :] = cp2_rank0_logits[:, chunk_size:, :]
     
-    print(f"    ✅ Rank 0: placed chunk 0 at [{chunk_0_start}:{chunk_0_end}], chunk 3 at [{chunk_3_start}:{chunk_3_end}]")
+    logger.debug(f"Rank 0: placed chunk 0 at [{chunk_0_start}:{chunk_0_end}], chunk 3 at [{chunk_3_start}:{chunk_3_end}]")
     
     # Rank 1: first half of its tensor goes to chunk 1, second half goes to chunk 2  
     chunk_1_start, chunk_1_end = chunk_size, 2 * chunk_size
@@ -124,27 +127,27 @@ def reconstruct_cp_logits_bshd(cp2_rank0_logits, cp2_rank1_logits, cp1_baseline_
     reconstructed_logits[:, chunk_1_start:chunk_1_end, :] = cp2_rank1_logits[:, :chunk_size, :]
     reconstructed_logits[:, chunk_2_start:chunk_2_end, :] = cp2_rank1_logits[:, chunk_size:, :]
     
-    print(f"    ✅ Rank 1: placed chunk 1 at [{chunk_1_start}:{chunk_1_end}], chunk 2 at [{chunk_2_start}:{chunk_2_end}]")
+    logger.debug(f"Rank 1: placed chunk 1 at [{chunk_1_start}:{chunk_1_end}], chunk 2 at [{chunk_2_start}:{chunk_2_end}]")
     
     # Debug: Check if reconstruction makes sense by comparing a few elements
-    print(f"  🔍 Reconstruction verification:")
-    print(f"    Baseline sample [0,0,:3]: {cp1_baseline_logits[0,0,:3]}")
-    print(f"    Reconstructed [0,0,:3]: {reconstructed_logits[0,0,:3]}")
-    print(f"    Rank0 input [0,0,:3]: {cp2_rank0_logits[0,0,:3]}")
+    logger.debug("Reconstruction verification:")
+    logger.debug(f"  Baseline sample [0,0,:3]: {cp1_baseline_logits[0,0,:3]}")
+    logger.debug(f"  Reconstructed [0,0,:3]: {reconstructed_logits[0,0,:3]}")
+    logger.debug(f"  Rank0 input [0,0,:3]: {cp2_rank0_logits[0,0,:3]}")
     
     # Check if we have any zeros where we shouldn't
     zero_positions = (reconstructed_logits == 0).all(dim=-1).sum()
     total_positions = reconstructed_logits.shape[0] * reconstructed_logits.shape[1]
-    print(f"    Zero positions: {zero_positions}/{total_positions}")
+    logger.debug(f"  Zero positions: {zero_positions}/{total_positions}")
     
     # Sanity check: if reconstruction is perfect, difference should be minimal
     perfect_match = torch.allclose(reconstructed_logits, cp1_baseline_logits, atol=1e-6)
-    print(f"    Perfect reconstruction (1e-6 tolerance): {perfect_match}")
+    logger.debug(f"  Perfect reconstruction (1e-6 tolerance): {perfect_match}")
     if not perfect_match:
         diff_stats = (reconstructed_logits - cp1_baseline_logits).abs()
-        print(f"    Reconstruction diff - max: {diff_stats.max():.6f}, mean: {diff_stats.mean():.6f}")
+        logger.debug(f"  Reconstruction diff - max: {diff_stats.max():.6f}, mean: {diff_stats.mean():.6f}")
     
-    print(f"  Reconstructed logits shape: {reconstructed_logits.shape}")
+    logger.info(f"  Reconstructed logits shape: {reconstructed_logits.shape}")
     return reconstructed_logits
 
 def compare_logits(reconstructed_logits, baseline_logits, name="Reconstructed"):
@@ -156,6 +159,7 @@ def compare_logits(reconstructed_logits, baseline_logits, name="Reconstructed"):
         baseline_logits: Baseline logits tensor  
         name: Name for the comparison (for printing)
     """
+    logger = logging.getLogger(__name__)
     logits_abs_diff = torch.abs(reconstructed_logits - baseline_logits)
     logits_diff = logits_abs_diff.max().item()
     logits_mean_diff = logits_abs_diff.mean().item()
@@ -166,14 +170,14 @@ def compare_logits(reconstructed_logits, baseline_logits, name="Reconstructed"):
     within_2e2 = (logits_abs_diff < LOGITS_ELEMENT_TOLERANCE).sum().item()
     within_5e2 = (logits_abs_diff < 5e-2).sum().item()
     
-    print(f"\n📊 {name} Logits Comparison:")
-    print(f"  Total elements: {total_elements}")
-    print(f"  Max difference: {logits_diff:.8f}")
-    print(f"  Mean difference: {logits_mean_diff:.8f}")
-    print(f"  Elements within 1e-3: {within_1e3}/{total_elements} ({100*within_1e3/total_elements:.1f}%)")
-    print(f"  Elements within 1e-2: {within_1e2}/{total_elements} ({100*within_1e2/total_elements:.1f}%)")
-    print(f"  Elements within {LOGITS_ELEMENT_TOLERANCE}: {within_2e2}/{total_elements} ({100*within_2e2/total_elements:.1f}%)")
-    print(f"  Elements within 5e-2: {within_5e2}/{total_elements} ({100*within_5e2/total_elements:.1f}%)")
+    logger.info(f"{name} Logits Comparison:")
+    logger.info(f"  Total elements: {total_elements}")
+    logger.info(f"  Max difference: {logits_diff:.8f}")
+    logger.info(f"  Mean difference: {logits_mean_diff:.8f}")
+    logger.info(f"  Elements within 1e-3: {within_1e3}/{total_elements} ({100*within_1e3/total_elements:.1f}%)")
+    logger.info(f"  Elements within 1e-2: {within_1e2}/{total_elements} ({100*within_1e2/total_elements:.1f}%)")
+    logger.info(f"  Elements within {LOGITS_ELEMENT_TOLERANCE}: {within_2e2}/{total_elements} ({100*within_2e2/total_elements:.1f}%)")
+    logger.info(f"  Elements within 5e-2: {within_5e2}/{total_elements} ({100*within_5e2/total_elements:.1f}%)")
     
     return {
         'max_diff': logits_diff,
@@ -211,6 +215,7 @@ def load_test_data():
 
 def test_data_loading(load_test_data):
     """Test that all required data is loaded correctly."""
+    logger = logging.getLogger(__name__)
     test_data = load_test_data
     
     # Check that all data structures have expected keys
@@ -233,13 +238,14 @@ def test_data_loading(load_test_data):
     assert cp2_rank0_logits.shape[2] == vocab_size, f"Vocab size mismatch: CP=1 has {vocab_size}, CP=2 rank 0 has {cp2_rank0_logits.shape[2]}"
     assert cp2_rank1_logits.shape[2] == vocab_size, f"Vocab size mismatch: CP=1 has {vocab_size}, CP=2 rank 1 has {cp2_rank1_logits.shape[2]}"
     
-    print(f"✅ Data loaded successfully:")
-    print(f"  CP=1 logits shape: {cp1_logits.shape}")
-    print(f"  CP=2 rank 0 logits shape: {cp2_rank0_logits.shape}")
-    print(f"  CP=2 rank 1 logits shape: {cp2_rank1_logits.shape}")
+    logger.info("Data loaded successfully:")
+    logger.info(f"  CP=1 logits shape: {cp1_logits.shape}")
+    logger.info(f"  CP=2 rank 0 logits shape: {cp2_rank0_logits.shape}")
+    logger.info(f"  CP=2 rank 1 logits shape: {cp2_rank1_logits.shape}")
 
 def test_cp_indices_calculation(load_test_data):
     """Test that CP indices calculation works correctly for BSHD format."""
+    logger = logging.getLogger(__name__)
     test_data = load_test_data
     
     # Get baseline logits to determine batch size and sequence length
@@ -267,14 +273,15 @@ def test_cp_indices_calculation(load_test_data):
     combined_indices = set(rank_indices[0] + rank_indices[1])
     expected_coverage = len(rank_indices[0]) + len(rank_indices[1])
     
-    print(f"✅ CP indices calculation (BSHD):")
-    print(f"  Batch size: {batch_size}, Sequence length: {seq_len}")
-    print(f"  Rank 0 seq positions: {len(rank_indices[0])} - {rank_indices[0]}")
-    print(f"  Rank 1 seq positions: {len(rank_indices[1])} - {rank_indices[1]}")
-    print(f"  Combined coverage: {expected_coverage}")
+    logger.info("CP indices calculation (BSHD):")
+    logger.info(f"  Batch size: {batch_size}, Sequence length: {seq_len}")
+    logger.info(f"  Rank 0 seq positions: {len(rank_indices[0])} - {rank_indices[0]}")
+    logger.info(f"  Rank 1 seq positions: {len(rank_indices[1])} - {rank_indices[1]}")
+    logger.info(f"  Combined coverage: {expected_coverage}")
 
 def test_logits_reconstruction(load_test_data):
     """Test that CP=2 logits can be reconstructed from both ranks for BSHD format."""
+    logger = logging.getLogger(__name__)
     test_data = load_test_data
     
     cp2_rank0_logits = test_data['cp2_rank0_results']['logits']
@@ -295,12 +302,13 @@ def test_logits_reconstruction(load_test_data):
     assert reconstructed_cp2_logits.shape == cp1_logits.shape, \
         f"Reconstructed shape {reconstructed_cp2_logits.shape} doesn't match baseline {cp1_logits.shape}"
     
-    print(f"✅ Logits reconstruction successful (BSHD):")
-    print(f"  Reconstructed shape: {reconstructed_cp2_logits.shape}")
-    print(f"  Baseline shape: {cp1_logits.shape}")
+    logger.info("Logits reconstruction successful (BSHD):")
+    logger.info(f"  Reconstructed shape: {reconstructed_cp2_logits.shape}")
+    logger.info(f"  Baseline shape: {cp1_logits.shape}")
 
 def test_cp2_vs_cp1_logits_accuracy(load_test_data):
     """Test that CP=2 logits match CP=1 baseline within acceptable tolerance for BSHD format."""
+    logger = logging.getLogger(__name__)
     test_data = load_test_data
     
     cp2_rank0_logits = test_data['cp2_rank0_results']['logits']
@@ -326,10 +334,11 @@ def test_cp2_vs_cp1_logits_accuracy(load_test_data):
         f"Logits accuracy {actual_accuracy:.1f}% is below threshold {LOGITS_ACCURACY_THRESHOLD}%. " \
         f"Max diff: {comparison_stats['max_diff']:.6f}, Mean diff: {comparison_stats['mean_diff']:.6f}"
     
-    print(f"✅ Logits accuracy test passed (BSHD): {actual_accuracy:.1f}% within {LOGITS_ELEMENT_TOLERANCE} tolerance")
+    logger.info(f"Logits accuracy test passed (BSHD): {actual_accuracy:.1f}% within {LOGITS_ELEMENT_TOLERANCE} tolerance")
 
 def test_cp2_vs_cp1_loss_similarity(load_test_data):
     """Test that CP=2 and CP=1 losses are similar."""
+    logger = logging.getLogger(__name__)
     test_data = load_test_data
     
     # Check if loss data is available
@@ -354,14 +363,15 @@ def test_cp2_vs_cp1_loss_similarity(load_test_data):
         f"Loss relative difference {100*loss_rel_diff:.2f}% exceeds {100*LOSS_RELATIVE_DIFF_THRESHOLD:.1f}% threshold. " \
         f"CP=1: {cp1_loss:.6f}, CP=2 avg: {cp2_avg_loss:.6f}"
     
-    print(f"✅ Loss similarity test passed:")
-    print(f"  CP=1 loss: {cp1_loss:.6f}")
-    print(f"  CP=2 rank 0 loss: {cp2_rank0_loss:.6f}")
-    print(f"  CP=2 rank 1 loss: {cp2_rank1_loss:.6f}")
-    print(f"  Relative difference: {100*loss_rel_diff:.2f}%")
+    logger.info("Loss similarity test passed:")
+    logger.info(f"  CP=1 loss: {cp1_loss:.6f}")
+    logger.info(f"  CP=2 rank 0 loss: {cp2_rank0_loss:.6f}")
+    logger.info(f"  CP=2 rank 1 loss: {cp2_rank1_loss:.6f}")
+    logger.info(f"  Relative difference: {100*loss_rel_diff:.2f}%")
 
 def test_cp2_vs_cp1_gradient_similarity(load_test_data):
     """Test that CP=2 and CP=1 gradient norms are similar."""
+    logger = logging.getLogger(__name__)
     test_data = load_test_data
     
     # Check if gradient data is available
@@ -421,11 +431,11 @@ def test_cp2_vs_cp1_gradient_similarity(load_test_data):
         f"Excellent: {excellent_count}, Good: {good_count}, Acceptable: {acceptable_count}, " \
         f"Total compared: {len(grad_comparisons)}"
     
-    print(f"✅ Gradient similarity test passed: {grad_success_rate:.1f}% of gradients are acceptable")
-    print(f"  Max absolute difference: {max_abs_diff:.6f} (threshold: {GRADIENT_MAX_ABSOLUTE_DIFF_TOLERANCE}) - {max_abs_diff_param}")
-    print(f"  Excellent (L2 < {GRADIENT_EXCELLENT_THRESHOLD}): {excellent_count}/{len(grad_comparisons)}")
-    print(f"  Good (rel < {GRADIENT_GOOD_REL_THRESHOLD}): {good_count}/{len(grad_comparisons)}")
-    print(f"  Acceptable (rel < {GRADIENT_ACCEPTABLE_REL_THRESHOLD}): {acceptable_count}/{len(grad_comparisons)}")
+    logger.info(f"Gradient similarity test passed: {grad_success_rate:.1f}% of gradients are acceptable")
+    logger.info(f"  Max absolute difference: {max_abs_diff:.6f} (threshold: {GRADIENT_MAX_ABSOLUTE_DIFF_TOLERANCE}) - {max_abs_diff_param}")
+    logger.info(f"  Excellent (L2 < {GRADIENT_EXCELLENT_THRESHOLD}): {excellent_count}/{len(grad_comparisons)}")
+    logger.info(f"  Good (rel < {GRADIENT_GOOD_REL_THRESHOLD}): {good_count}/{len(grad_comparisons)}")
+    logger.info(f"  Acceptable (rel < {GRADIENT_ACCEPTABLE_REL_THRESHOLD}): {acceptable_count}/{len(grad_comparisons)}")
 
 if __name__ == "__main__":
     # Allow running as script for debugging

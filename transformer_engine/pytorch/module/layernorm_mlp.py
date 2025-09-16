@@ -91,7 +91,11 @@ def _get_act_func_supported_list(recipe: Optional[Recipe] = None):
             "qgelu": (tex.qgelu, tex.dqgelu, None),
             "qgeglu": (tex.qgeglu, tex.dqgeglu, None),
             "relu": (tex.relu, tex.drelu, None),
+            "reglu": (tex.reglu, tex.dreglu, None),
             "srelu": (tex.srelu, tex.dsrelu, None),
+            "sreglu": (tex.sreglu, tex.dsreglu, None),
+            "silu": (tex.silu, tex.dsilu, None),
+            "swiglu": (tex.swiglu, tex.dswiglu, None),
         }
     if recipe.delayed() or recipe.mxfp8():
         # Delayed scaling, fusion supported list: [tex.dbias_dgelu, tex.dbias_drelu, tex.dbias_dqgelu, tex.dbias_dsrelu]
@@ -102,11 +106,11 @@ def _get_act_func_supported_list(recipe: Optional[Recipe] = None):
             "qgelu": (tex.qgelu, tex.dqgelu, tex.dbias_dqgelu),
             "qgeglu": (tex.qgeglu, tex.dqgeglu, None),
             "relu": (tex.relu, tex.drelu, tex.dbias_drelu),
-
+            "reglu": (tex.reglu, tex.dreglu, None),
             "srelu": (tex.srelu, tex.dsrelu, tex.dbias_dsrelu),
-
+            "sreglu": (tex.sreglu, tex.dsreglu, None),
             "silu": (tex.silu, tex.dsilu, tex.dbias_dsilu),
-
+            "swiglu": (tex.swiglu, tex.dswiglu, None),
         }
     # no activation fusion written yet
     # Per-tensor current scaling or fp8 blockwise scaling: []
@@ -117,11 +121,11 @@ def _get_act_func_supported_list(recipe: Optional[Recipe] = None):
             "qgelu": (tex.qgelu, tex.dqgelu, None),
             "qgeglu": (tex.qgeglu, tex.dqgeglu, None),
             "relu": (tex.relu, tex.drelu, None),
-
+            "reglu": (tex.reglu, tex.dreglu, None),
             "srelu": (tex.srelu, tex.dsrelu, None),
-
-
-
+            "sreglu": (tex.sreglu, tex.dsreglu, None),
+            "silu": (tex.silu, tex.dsilu, None),
+            "swiglu": (tex.swiglu, tex.dswiglu, None),
         }
     raise NotImplementedError(f"Unhandled recipe type {recipe}")
 
