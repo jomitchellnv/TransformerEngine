@@ -322,7 +322,7 @@ class _Linear(torch.autograd.Function):
 
         # Configure output quantizer
         if output_quantizer is not None:
-            output_quantizer.set_usage(rowwise=True, columnwise=False)
+            output_quantizer.set_usage(rowwise=True, columnwise=is_grad_enabled)
 
         # Output buffer for Userbuffers reduce-scatter
         reduce_scatter_out = None

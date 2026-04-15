@@ -984,7 +984,7 @@ class _ViewFunc(torch.autograd.Function):
                 with_gemm_swizzled_scales=grad._with_gemm_swizzled_scales,
             )
             return dgrad, None
-        return grad.view(ctx.shape), None
+        return grad.reshape(ctx.shape), None
 
 
 class _ReshapeFunc(torch.autograd.Function):
@@ -1071,4 +1071,4 @@ class _ReshapeFunc(torch.autograd.Function):
                 with_gemm_swizzled_scales=grad._with_gemm_swizzled_scales,
             )
             return dgrad, None
-        return grad.view(ctx.shape), None
+        return grad.reshape(ctx.shape), None

@@ -15,10 +15,117 @@ from transformer_engine_torch import DType as TE_DType
 from transformer_engine.common.recipe import Float8BlockScaling, Recipe
 from .storage.float8_blockwise_tensor_storage import Float8BlockwiseQTensorStorage
 from ..quantized_tensor import QuantizedTensor, Quantizer
-from ._quantization_helpers import _IdentityFunc
+from ._quantization_helpers import _DequantizeFunc, _IdentityFunc
 from ..utils import devices_match, round_up_to_nearest_multiple
 
 aten = torch.ops.aten
+
+
+class _SigmoidToFloat8Func(torch.autograd.Function):
+    """Sigmoid autograd bridge that preserves Float8BlockwiseQTensor outputs."""
+
+    @staticmethod
+    def forward(ctx, tensor: "Float8BlockwiseQTensor") -> "Float8BlockwiseQTensor":
+        quantizer = tensor._get_quantizer().copy()
+        quantizer.set_usage(rowwise=True, columnwise=True)
+        with torch._C._DisableTorchDispatch():
+            out = torch.sigmoid(tensor.dequantize())
+        out_q = quantizer.quantize(out, dtype=tensor.dtype)
+        ctx.save_for_backward(out_q)
+        ctx.input_dtype = tensor.dtype
+        return out_q.requires_grad_(out.requires_grad)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (out_q,) = ctx.saved_tensors
+        out = out_q.dequantize(dtype=ctx.input_dtype)
+        if isinstance(grad, QuantizedTensor):
+            grad = grad.dequantize(dtype=ctx.input_dtype)
+        elif grad.dtype != ctx.input_dtype:
+            grad = grad.to(ctx.input_dtype)
+        grad_input = grad * out * (1 - out)
+        return grad_input
+
+
+def _dequantize_dispatch_input(arg):
+    """Convert quantized inputs to plain tensors inside dispatch handlers."""
+    if isinstance(arg, QuantizedTensor):
+        with torch._C._DisableTorchDispatch():
+            return arg.dequantize()
+    return arg
+
+
+def _dispatch_input_dtype(arg) -> Optional[torch.dtype]:
+    """Nominal dtype for dispatch handler gradient outputs."""
+    if isinstance(arg, QuantizedTensor):
+        return arg.dtype
+    if isinstance(arg, torch.Tensor):
+        return arg.dtype
+    return None
+
+
+class _ReluToFloat8Func(torch.autograd.Function):
+    """ReLU autograd bridge that preserves Float8BlockwiseQTensor outputs."""
+
+    @staticmethod
+    def forward(ctx, tensor: "Float8BlockwiseQTensor") -> "Float8BlockwiseQTensor":
+        quantizer = tensor._get_quantizer().copy()
+        quantizer.set_usage(rowwise=True, columnwise=True)
+        out = torch.relu(_dequantize_dispatch_input(tensor))
+        out_q = quantizer.quantize(out, dtype=tensor.dtype)
+        ctx.save_for_backward(out_q)
+        ctx.input_dtype = tensor.dtype
+        return out_q
+
+    @staticmethod
+    def backward(ctx, grad):
+        (out_q,) = ctx.saved_tensors
+        out = out_q.dequantize(dtype=ctx.input_dtype)
+        if isinstance(grad, QuantizedTensor):
+            grad = grad.dequantize(dtype=ctx.input_dtype)
+        elif grad.dtype != ctx.input_dtype:
+            grad = grad.to(ctx.input_dtype)
+        return grad * (out > 0).to(dtype=grad.dtype)
+
+
+class _MulToFloat8Func(torch.autograd.Function):
+    """Elementwise multiply bridge that preserves Float8BlockwiseQTensor outputs."""
+
+    @staticmethod
+    def forward(ctx, lhs, rhs):
+        lhs_hp = _dequantize_dispatch_input(lhs)
+        rhs_hp = _dequantize_dispatch_input(rhs)
+        out = lhs_hp * rhs_hp
+        quantizer_src = lhs if isinstance(lhs, Float8BlockwiseQTensor) else rhs
+        assert isinstance(quantizer_src, Float8BlockwiseQTensor)
+        quantizer = quantizer_src._get_quantizer().copy()
+        quantizer.set_usage(rowwise=True, columnwise=True)
+        lhs_saved = quantizer.quantize(lhs_hp, dtype=lhs_hp.dtype)
+        rhs_saved = quantizer.quantize(rhs_hp, dtype=rhs_hp.dtype)
+        ctx.save_for_backward(lhs_saved, rhs_saved)
+        ctx.lhs_dtype = _dispatch_input_dtype(lhs)
+        ctx.rhs_dtype = _dispatch_input_dtype(rhs)
+        ctx.lhs_is_tensor = isinstance(lhs, torch.Tensor)
+        ctx.rhs_is_tensor = isinstance(rhs, torch.Tensor)
+        return quantizer.quantize(out, dtype=quantizer_src.dtype)
+
+    @staticmethod
+    def backward(ctx, grad):
+        lhs_q, rhs_q = ctx.saved_tensors
+        lhs_hp = lhs_q.dequantize(dtype=ctx.lhs_dtype)
+        rhs_hp = rhs_q.dequantize(dtype=ctx.rhs_dtype)
+        if isinstance(grad, QuantizedTensor):
+            grad = grad.dequantize(dtype=ctx.lhs_dtype or ctx.rhs_dtype)
+        target_dtype = ctx.lhs_dtype or ctx.rhs_dtype
+        if target_dtype is not None and grad.dtype != target_dtype:
+            grad = grad.to(target_dtype)
+        grad_lhs = grad * rhs_hp if ctx.lhs_is_tensor else None
+        grad_rhs = grad * lhs_hp if ctx.rhs_is_tensor else None
+        if grad_lhs is not None and ctx.lhs_dtype is not None and grad_lhs.dtype != ctx.lhs_dtype:
+            grad_lhs = grad_lhs.to(ctx.lhs_dtype)
+        if grad_rhs is not None and ctx.rhs_dtype is not None and grad_rhs.dtype != ctx.rhs_dtype:
+            grad_rhs = grad_rhs.to(ctx.rhs_dtype)
+        return grad_lhs, grad_rhs
 
 
 class Float8BlockQuantizer(Quantizer):
@@ -359,7 +466,11 @@ class Float8BlockwiseQTensor(Float8BlockwiseQTensorStorage, QuantizedTensor):
             dequant_dtype = dtype
         else:
             dequant_dtype = self.dtype
-        return super().dequantize(dtype=dequant_dtype)
+        return _DequantizeFunc.apply(
+            self,
+            dequant_dtype,
+            Float8BlockwiseQTensorStorage.dequantize,
+        )
 
     def detach(self) -> Float8BlockwiseQTensor:
         # pylint: disable=missing-function-docstring
@@ -406,6 +517,7 @@ class Float8BlockwiseQTensor(Float8BlockwiseQTensorStorage, QuantizedTensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs=None):
+        kwargs = kwargs or {}
 
         # View op
         if func == aten.view.default:
@@ -464,6 +576,14 @@ class Float8BlockwiseQTensor(Float8BlockwiseQTensorStorage, QuantizedTensor):
                 if t is not None and t.is_cuda:
                     t.record_stream(stream)
             return None
+
+        # Unary elementwise ops that can stay in blockwise FP8.
+        if func == aten.sigmoid.default:
+            return _SigmoidToFloat8Func.apply(args[0])
+        if func == aten.relu.default:
+            return _ReluToFloat8Func.apply(args[0])
+        if func == aten.mul.Tensor:
+            return _MulToFloat8Func.apply(args[0], args[1])
 
         # Default case
         return super().__torch_dispatch__(func, types, args, kwargs)
@@ -836,7 +956,7 @@ class _ViewFunc(torch.autograd.Function):
                 requires_grad=grad.requires_grad,
             )
             return dgrad, None
-        return grad.view(ctx.shape), None
+        return grad.reshape(ctx.shape), None
 
 
 class _ReshapeFunc(torch.autograd.Function):
@@ -949,4 +1069,4 @@ class _ReshapeFunc(torch.autograd.Function):
                 requires_grad=grad.requires_grad,
             )
             return dgrad, None
-        return grad.view(ctx.shape), None
+        return grad.reshape(ctx.shape), None

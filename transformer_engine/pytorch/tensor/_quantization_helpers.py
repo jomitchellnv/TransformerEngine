@@ -38,6 +38,31 @@ class _QuantizeFunc(torch.autograd.Function):
         return grad, None
 
 
+class _DequantizeFunc(torch.autograd.Function):
+    """Dequantize tensor while preserving the autograd edge."""
+
+    @staticmethod
+    def forward(
+        ctx: Optional[torch.autograd.function.FunctionCtx],
+        tensor: QuantizedTensor,
+        dtype: torch.dtype,
+        dequantize_impl: Callable,
+    ) -> torch.Tensor:
+        # pylint: disable=missing-function-docstring
+        ctx.input_dtype = tensor.dtype
+        return dequantize_impl(tensor, dtype=dtype)
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        grad: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], ...]:
+        # pylint: disable=missing-function-docstring
+        if grad.dtype != ctx.input_dtype:
+            grad = grad.to(ctx.input_dtype)
+        return grad, None, None
+
+
 class _IdentityFunc(torch.autograd.Function):
     """Identity function
 
