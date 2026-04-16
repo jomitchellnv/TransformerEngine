@@ -383,7 +383,10 @@ class Float8BlockwiseQTensorStorage(QuantizedTensorStorage):
         ), "Must retain some data either columnwise or rowwise"
 
         if columnwise_usage and rowwise_usage:
-            if not self._is_2D_scaled:
+            if self._is_2D_scaled:
+                if self._columnwise_data is None or self._columnwise_scale_inv is None:
+                    self._create_columnwise()
+            else:
                 # For 1D scaling, we cannot create columnwise data/scale_inv from rowwise
                 # data/scale_inv because their scale values are different.
                 assert (
@@ -392,39 +395,6 @@ class Float8BlockwiseQTensorStorage(QuantizedTensorStorage):
                     and self._columnwise_data is not None
                     and self._columnwise_scale_inv is not None
                 ), "Cannot update to rowwise and columnwise usage."
-            else:
-                # For 2D scaling, rowwise and columnwise layouts are transposes of
-                # each other. Recreate the missing orientation lazily from the one
-                # that is still present.
-                if self._rowwise_data is None or self._rowwise_scale_inv is None:
-                    assert (
-                        self._columnwise_data is not None and self._columnwise_scale_inv is not None
-                    ), "Cannot update to rowwise and columnwise usage because both orientations are missing."
-                    columnwise_data = self._columnwise_data
-                    if not columnwise_data.is_contiguous():
-                        columnwise_data = columnwise_data.contiguous()
-                    self._rowwise_data = tex.fp8_transpose(
-                        columnwise_data, self._fp8_dtype, out=self._rowwise_data
-                    )
-                    if self._rowwise_scale_inv is None:
-                        assert self._quantizer is not None, (
-                            "._quantizer of Float8BlockwiseQTensor cannot be None because all the blockwise "
-                            "quantized tensors are supposed to be generated from the quantizer."
-                        )
-                        rowwise_scale_inv_shape = self._quantizer.get_scale_shape(
-                            self._rowwise_data.shape, False
-                        )
-                        self._rowwise_scale_inv = torch.empty(
-                            rowwise_scale_inv_shape,
-                            dtype=self._columnwise_scale_inv.dtype,
-                            device=self._columnwise_scale_inv.device,
-                        )
-                    columnwise_scale_inv = self._columnwise_scale_inv.transpose(-2, -1)
-                    h = min(self._rowwise_scale_inv.shape[0], columnwise_scale_inv.shape[0])
-                    w = min(self._rowwise_scale_inv.shape[1], columnwise_scale_inv.shape[1])
-                    self._rowwise_scale_inv[0:h, 0:w].copy_(columnwise_scale_inv[0:h, 0:w])
-                if self._columnwise_data is None or self._columnwise_scale_inv is None:
-                    self._create_columnwise()
             return
 
         if rowwise_usage:

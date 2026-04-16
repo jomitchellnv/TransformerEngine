@@ -41,27 +41,6 @@ class _SigmoidToFloat8Func(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         (out_q,) = ctx.saved_tensors
-        if (
-            isinstance(out_q, Float8BlockwiseQTensor)
-            and out_q._rowwise_data is not None
-            and out_q._rowwise_scale_inv is not None
-            and not out_q._is_2D_scaled
-        ):
-            target_dtype = ctx.input_dtype
-            if isinstance(grad, QuantizedTensor):
-                grad = grad.dequantize(dtype=target_dtype)
-            elif target_dtype is not None and grad.dtype != target_dtype:
-                grad = grad.to(target_dtype)
-            grad_f = grad.contiguous().to(dtype=torch.float32)
-            mod = _get_fused_elementwise_module()
-            grad_input = mod.fused_sigmoid_fp8_backward(
-                out_q._rowwise_data,
-                out_q._rowwise_scale_inv,
-                grad_f,
-            )
-            if target_dtype is not None and grad_input.dtype != target_dtype:
-                grad_input = grad_input.to(target_dtype)
-            return grad_input
         out = out_q.dequantize(dtype=ctx.input_dtype)
         if isinstance(grad, QuantizedTensor):
             grad = grad.dequantize(dtype=ctx.input_dtype)
@@ -146,35 +125,6 @@ class _MulToFloat8Func(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         lhs_q, rhs_q = ctx.saved_tensors
-        if (
-            isinstance(lhs_q, Float8BlockwiseQTensor)
-            and isinstance(rhs_q, Float8BlockwiseQTensor)
-            and lhs_q._rowwise_data is not None
-            and lhs_q._rowwise_scale_inv is not None
-            and rhs_q._rowwise_data is not None
-            and rhs_q._rowwise_scale_inv is not None
-            and not lhs_q._is_2D_scaled
-            and not rhs_q._is_2D_scaled
-        ):
-            target_dtype = ctx.lhs_dtype or ctx.rhs_dtype
-            if isinstance(grad, QuantizedTensor):
-                grad = grad.dequantize(dtype=target_dtype)
-            if target_dtype is not None and grad.dtype != target_dtype:
-                grad = grad.to(target_dtype)
-            grad_f = grad.contiguous().to(dtype=torch.float32)
-            mod = _get_fused_elementwise_module()
-            grad_lhs, grad_rhs = mod.fused_mul_fp8_backward(
-                lhs_q._rowwise_data,
-                lhs_q._rowwise_scale_inv,
-                rhs_q._rowwise_data,
-                rhs_q._rowwise_scale_inv,
-                grad_f,
-            )
-            if ctx.lhs_is_tensor and ctx.lhs_dtype is not None and grad_lhs.dtype != ctx.lhs_dtype:
-                grad_lhs = grad_lhs.to(ctx.lhs_dtype)
-            if ctx.rhs_is_tensor and ctx.rhs_dtype is not None and grad_rhs.dtype != ctx.rhs_dtype:
-                grad_rhs = grad_rhs.to(ctx.rhs_dtype)
-            return grad_lhs if ctx.lhs_is_tensor else None, grad_rhs if ctx.rhs_is_tensor else None
         lhs_hp = lhs_q.dequantize(dtype=ctx.lhs_dtype)
         rhs_hp = rhs_q.dequantize(dtype=ctx.rhs_dtype)
         if isinstance(grad, QuantizedTensor):
@@ -659,8 +609,6 @@ def fused_sigmoid_gate_forward_fp8(
     proj: "Float8BlockwiseQTensor",
     gate: "Float8BlockwiseQTensor",
     mask: Optional[torch.Tensor] = None,
-    *,
-    preserve_columnwise_output: bool = True,
 ) -> tuple["Float8BlockwiseQTensor", "Float8BlockwiseQTensor"]:
     """Fused forward for proj * sigmoid(gate), returning output and saved sigmoid state."""
     if (
@@ -691,7 +639,7 @@ def fused_sigmoid_gate_forward_fp8(
         mask_flat,
     )
     out_quantizer = proj._get_quantizer().copy()
-    out_quantizer.set_usage(rowwise=True, columnwise=preserve_columnwise_output)
+    out_quantizer.set_usage(rowwise=True, columnwise=True)
     out_q = Float8BlockwiseQTensor(
         shape=proj.shape,
         dtype=proj.dtype,
@@ -704,8 +652,7 @@ def fused_sigmoid_gate_forward_fp8(
         is_2D_scaled=True,
         requires_grad=proj.requires_grad or gate.requires_grad,
     )
-    if preserve_columnwise_output:
-        out_q.update_usage(rowwise_usage=True, columnwise_usage=True)
+    out_q.update_usage(rowwise_usage=True, columnwise_usage=True)
 
     g_quantizer = gate._get_quantizer().copy()
     g_quantizer.set_usage(rowwise=True, columnwise=False)
