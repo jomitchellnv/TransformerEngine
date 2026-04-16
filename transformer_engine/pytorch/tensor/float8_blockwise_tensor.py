@@ -6,6 +6,7 @@
 from __future__ import annotations
 from collections.abc import Iterable
 import math
+import os
 import warnings
 from typing import Any, Optional, Tuple, Union
 
@@ -13,12 +14,14 @@ import torch
 import transformer_engine_torch as tex
 from transformer_engine_torch import DType as TE_DType
 from transformer_engine.common.recipe import Float8BlockScaling, Recipe
+from torch.utils.cpp_extension import load_inline
 from .storage.float8_blockwise_tensor_storage import Float8BlockwiseQTensorStorage
 from ..quantized_tensor import QuantizedTensor, Quantizer
 from ._quantization_helpers import _DequantizeFunc, _IdentityFunc
 from ..utils import devices_match, round_up_to_nearest_multiple
 
 aten = torch.ops.aten
+_FUSED_ELEMENTWISE_MODULE = None
 
 
 class _SigmoidToFloat8Func(torch.autograd.Function):
@@ -38,6 +41,27 @@ class _SigmoidToFloat8Func(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         (out_q,) = ctx.saved_tensors
+        if (
+            isinstance(out_q, Float8BlockwiseQTensor)
+            and out_q._rowwise_data is not None
+            and out_q._rowwise_scale_inv is not None
+            and not out_q._is_2D_scaled
+        ):
+            target_dtype = ctx.input_dtype
+            if isinstance(grad, QuantizedTensor):
+                grad = grad.dequantize(dtype=target_dtype)
+            elif target_dtype is not None and grad.dtype != target_dtype:
+                grad = grad.to(target_dtype)
+            grad_f = grad.contiguous().to(dtype=torch.float32)
+            mod = _get_fused_elementwise_module()
+            grad_input = mod.fused_sigmoid_fp8_backward(
+                out_q._rowwise_data,
+                out_q._rowwise_scale_inv,
+                grad_f,
+            )
+            if target_dtype is not None and grad_input.dtype != target_dtype:
+                grad_input = grad_input.to(target_dtype)
+            return grad_input
         out = out_q.dequantize(dtype=ctx.input_dtype)
         if isinstance(grad, QuantizedTensor):
             grad = grad.dequantize(dtype=ctx.input_dtype)
@@ -80,6 +104,16 @@ class _ReluToFloat8Func(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         (out_q,) = ctx.saved_tensors
+        if (
+            isinstance(out_q, Float8BlockwiseQTensor)
+            and out_q._rowwise_data is not None
+            and not out_q._is_2D_scaled
+        ):
+            return fused_relu_backward_fp8(
+                out_q._rowwise_data,
+                grad,
+                input_dtype=ctx.input_dtype,
+            )
         out = out_q.dequantize(dtype=ctx.input_dtype)
         if isinstance(grad, QuantizedTensor):
             grad = grad.dequantize(dtype=ctx.input_dtype)
@@ -112,6 +146,35 @@ class _MulToFloat8Func(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         lhs_q, rhs_q = ctx.saved_tensors
+        if (
+            isinstance(lhs_q, Float8BlockwiseQTensor)
+            and isinstance(rhs_q, Float8BlockwiseQTensor)
+            and lhs_q._rowwise_data is not None
+            and lhs_q._rowwise_scale_inv is not None
+            and rhs_q._rowwise_data is not None
+            and rhs_q._rowwise_scale_inv is not None
+            and not lhs_q._is_2D_scaled
+            and not rhs_q._is_2D_scaled
+        ):
+            target_dtype = ctx.lhs_dtype or ctx.rhs_dtype
+            if isinstance(grad, QuantizedTensor):
+                grad = grad.dequantize(dtype=target_dtype)
+            if target_dtype is not None and grad.dtype != target_dtype:
+                grad = grad.to(target_dtype)
+            grad_f = grad.contiguous().to(dtype=torch.float32)
+            mod = _get_fused_elementwise_module()
+            grad_lhs, grad_rhs = mod.fused_mul_fp8_backward(
+                lhs_q._rowwise_data,
+                lhs_q._rowwise_scale_inv,
+                rhs_q._rowwise_data,
+                rhs_q._rowwise_scale_inv,
+                grad_f,
+            )
+            if ctx.lhs_is_tensor and ctx.lhs_dtype is not None and grad_lhs.dtype != ctx.lhs_dtype:
+                grad_lhs = grad_lhs.to(ctx.lhs_dtype)
+            if ctx.rhs_is_tensor and ctx.rhs_dtype is not None and grad_rhs.dtype != ctx.rhs_dtype:
+                grad_rhs = grad_rhs.to(ctx.rhs_dtype)
+            return grad_lhs if ctx.lhs_is_tensor else None, grad_rhs if ctx.rhs_is_tensor else None
         lhs_hp = lhs_q.dequantize(dtype=ctx.lhs_dtype)
         rhs_hp = rhs_q.dequantize(dtype=ctx.rhs_dtype)
         if isinstance(grad, QuantizedTensor):
@@ -126,6 +189,631 @@ class _MulToFloat8Func(torch.autograd.Function):
         if grad_rhs is not None and ctx.rhs_dtype is not None and grad_rhs.dtype != ctx.rhs_dtype:
             grad_rhs = grad_rhs.to(ctx.rhs_dtype)
         return grad_lhs, grad_rhs
+
+
+def _get_fused_elementwise_module():
+    """Lazily JIT-compile fused FP8 elementwise kernels used by Variant C."""
+    global _FUSED_ELEMENTWISE_MODULE
+    if _FUSED_ELEMENTWISE_MODULE is not None:
+        return _FUSED_ELEMENTWISE_MODULE
+
+    arch_suffix = "cpu"
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        arch_suffix = f"sm{major}{minor}"
+        if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
+    # Keep the extension name stable so all ranks can reuse the same compiled artifact.
+    module_name = f"fused_elementwise_fp8_{arch_suffix}_v2"
+    cpp_source = r"""
+    #include <torch/extension.h>
+    #include <vector>
+
+    std::vector<torch::Tensor> fused_sigmoid_gate_fp8_forward(
+        torch::Tensor proj_data,
+        torch::Tensor proj_scale_inv,
+        torch::Tensor gate_data,
+        torch::Tensor gate_scale_inv,
+        torch::Tensor mask);
+
+    std::vector<torch::Tensor> fused_sigmoid_gate_fp8_backward(
+        torch::Tensor proj_data,
+        torch::Tensor proj_scale_inv,
+        torch::Tensor saved_g_data,
+        torch::Tensor saved_g_scale_inv,
+        torch::Tensor grad_out,
+        torch::Tensor mask);
+
+    torch::Tensor fused_sigmoid_fp8_backward(
+        torch::Tensor saved_out_data,
+        torch::Tensor saved_out_scale_inv,
+        torch::Tensor grad_out);
+
+    std::vector<torch::Tensor> fused_relu_fp8_forward(
+        torch::Tensor rowwise_data,
+        torch::Tensor columnwise_data);
+
+    torch::Tensor fused_relu_fp8_backward(
+        torch::Tensor saved_rowwise_data,
+        torch::Tensor grad_out);
+
+    std::vector<torch::Tensor> fused_mul_fp8_backward(
+        torch::Tensor lhs_data,
+        torch::Tensor lhs_scale_inv,
+        torch::Tensor rhs_data,
+        torch::Tensor rhs_scale_inv,
+        torch::Tensor grad_out);
+    """
+
+    cuda_source = r"""
+    #include <torch/extension.h>
+    #include <ATen/cuda/CUDAContext.h>
+    #include <cuda.h>
+    #include <cuda_bf16.h>
+    #include <cuda_fp8.h>
+    #include <vector>
+    #include <cmath>
+
+    namespace {
+    constexpr int kBlockLen = 128;
+    constexpr float kFp8E4M3Max = 448.0f;
+
+    __device__ inline float fp8_byte_to_float(uint8_t x) {
+      __nv_fp8_e4m3 v;
+      v.__x = x;
+      return static_cast<float>(v);
+    }
+
+    __device__ inline uint8_t float_to_fp8_byte(float x) {
+      return static_cast<uint8_t>(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3));
+    }
+
+    __device__ inline float maybe_pow2_scale_inv(float scale_inv) {
+      if (scale_inv <= 0.0f) {
+        return 1.0f;
+      }
+      return exp2f(ceilf(log2f(scale_inv)));
+    }
+
+    __device__ inline float sigmoidf_approx(float x) {
+      return 1.0f / (1.0f + expf(-x));
+    }
+
+    __global__ void fused_sigmoid_gate_fp8_fwd_kernel(
+        const uint8_t* proj_data,
+        const float* proj_scale_inv,
+        const uint8_t* gate_data,
+        const float* gate_scale_inv,
+        const float* mask,
+        uint8_t* out_data,
+        float* out_scale_inv,
+        uint8_t* saved_g_data,
+        float* saved_g_scale_inv,
+        int64_t M,
+        int64_t K,
+        int64_t scale_stride) {
+      const int tile_m = blockIdx.y;
+      const int tile_k = blockIdx.x;
+      const int64_t m0 = static_cast<int64_t>(tile_m) * kBlockLen;
+      const int64_t k0 = static_cast<int64_t>(tile_k) * kBlockLen;
+      __shared__ float smax_y[256];
+      __shared__ float smax_g[256];
+
+      float local_max_y = 0.0f;
+      float local_max_g = 0.0f;
+      for (int idx = threadIdx.x; idx < kBlockLen * kBlockLen; idx += blockDim.x) {
+        const int dm = idx / kBlockLen;
+        const int dk = idx % kBlockLen;
+        const int64_t m = m0 + dm;
+        const int64_t k = k0 + dk;
+        if (m >= M || k >= K) continue;
+        const int64_t flat = m * K + k;
+        const float proj = fp8_byte_to_float(proj_data[flat]) * proj_scale_inv[tile_m * scale_stride + tile_k];
+        const float gate = fp8_byte_to_float(gate_data[flat]) * gate_scale_inv[tile_m * scale_stride + tile_k];
+        const float g = sigmoidf_approx(gate);
+        float y = proj * g;
+        if (mask != nullptr) y *= mask[m];
+        local_max_y = fmaxf(local_max_y, fabsf(y));
+        local_max_g = fmaxf(local_max_g, fabsf(g));
+      }
+      smax_y[threadIdx.x] = local_max_y;
+      smax_g[threadIdx.x] = local_max_g;
+      __syncthreads();
+      for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset) {
+          smax_y[threadIdx.x] = fmaxf(smax_y[threadIdx.x], smax_y[threadIdx.x + offset]);
+          smax_g[threadIdx.x] = fmaxf(smax_g[threadIdx.x], smax_g[threadIdx.x + offset]);
+        }
+        __syncthreads();
+      }
+      const float tile_scale_inv_y = threadIdx.x == 0
+          ? maybe_pow2_scale_inv(smax_y[0] > 0.0f ? smax_y[0] / kFp8E4M3Max : 1.0f)
+          : 0.0f;
+      const float tile_scale_inv_g = threadIdx.x == 0
+          ? maybe_pow2_scale_inv(smax_g[0] > 0.0f ? smax_g[0] / kFp8E4M3Max : 1.0f)
+          : 0.0f;
+      __shared__ float scale_inv_y;
+      __shared__ float scale_inv_g;
+      if (threadIdx.x == 0) {
+        scale_inv_y = tile_scale_inv_y;
+        scale_inv_g = tile_scale_inv_g;
+        out_scale_inv[tile_m * scale_stride + tile_k] = tile_scale_inv_y;
+        saved_g_scale_inv[tile_m * scale_stride + tile_k] = tile_scale_inv_g;
+      }
+      __syncthreads();
+
+      for (int idx = threadIdx.x; idx < kBlockLen * kBlockLen; idx += blockDim.x) {
+        const int dm = idx / kBlockLen;
+        const int dk = idx % kBlockLen;
+        const int64_t m = m0 + dm;
+        const int64_t k = k0 + dk;
+        if (m >= M || k >= K) continue;
+        const int64_t flat = m * K + k;
+        const float proj = fp8_byte_to_float(proj_data[flat]) * proj_scale_inv[tile_m * scale_stride + tile_k];
+        const float gate = fp8_byte_to_float(gate_data[flat]) * gate_scale_inv[tile_m * scale_stride + tile_k];
+        const float g = sigmoidf_approx(gate);
+        float y = proj * g;
+        if (mask != nullptr) y *= mask[m];
+        out_data[flat] = float_to_fp8_byte(y / scale_inv_y);
+        saved_g_data[flat] = float_to_fp8_byte(g / scale_inv_g);
+      }
+    }
+
+    __global__ void fused_sigmoid_gate_fp8_bwd_kernel(
+        const uint8_t* proj_data,
+        const float* proj_scale_inv,
+        const uint8_t* saved_g_data,
+        const float* saved_g_scale_inv,
+        const float* grad_out,
+        const float* mask,
+        float* grad_proj,
+        float* grad_gate,
+        int64_t M,
+        int64_t K,
+        int64_t scale_stride) {
+      const int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+      const int64_t total = M * K;
+      if (flat >= total) return;
+      const int64_t m = flat / K;
+      const int64_t k = flat % K;
+      const int64_t tile_m = m / kBlockLen;
+      const int64_t tile_k = k / kBlockLen;
+      float gout = grad_out[flat];
+      if (mask != nullptr) gout *= mask[m];
+      const float proj = fp8_byte_to_float(proj_data[flat]) * proj_scale_inv[tile_m * scale_stride + tile_k];
+      const float g = fp8_byte_to_float(saved_g_data[flat]) * saved_g_scale_inv[tile_m * scale_stride + tile_k];
+      grad_proj[flat] = gout * g;
+      grad_gate[flat] = gout * proj * g * (1.0f - g);
+    }
+
+    __global__ void fused_relu_fp8_fwd_kernel(
+        const uint8_t* input,
+        uint8_t* output,
+        int64_t n) {
+      const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+      if (idx >= n) return;
+      const uint8_t x = input[idx];
+      const bool positive = ((x & 0x80u) == 0u) && (x != 0u);
+      output[idx] = positive ? x : static_cast<uint8_t>(0u);
+    }
+
+    __global__ void fused_relu_fp8_bwd_kernel(
+        const uint8_t* saved_rowwise_data,
+        const float* grad_out,
+        float* grad_input,
+        int64_t n) {
+      const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+      if (idx >= n) return;
+      const uint8_t x = saved_rowwise_data[idx];
+      const bool positive = ((x & 0x80u) == 0u) && (x != 0u);
+      grad_input[idx] = positive ? grad_out[idx] : 0.0f;
+    }
+
+    __global__ void fused_sigmoid_fp8_bwd_kernel(
+        const uint8_t* saved_out_data,
+        const float* saved_out_scale_inv,
+        const float* grad_out,
+        float* grad_input,
+        int64_t M,
+        int64_t K,
+        int64_t scale_stride) {
+      const int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+      const int64_t total = M * K;
+      if (flat >= total) return;
+      const int64_t m = flat / K;
+      const int64_t k = flat % K;
+      const int64_t tile_k = k / kBlockLen;
+      const float scale = saved_out_scale_inv[tile_k * scale_stride + m];
+      const float out = fp8_byte_to_float(saved_out_data[flat]) * scale;
+      grad_input[flat] = grad_out[flat] * out * (1.0f - out);
+    }
+
+    __global__ void fused_mul_fp8_bwd_kernel(
+        const uint8_t* lhs_data,
+        const float* lhs_scale_inv,
+        const uint8_t* rhs_data,
+        const float* rhs_scale_inv,
+        const float* grad_out,
+        float* grad_lhs,
+        float* grad_rhs,
+        int64_t M,
+        int64_t K,
+        int64_t scale_stride) {
+      const int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+      const int64_t total = M * K;
+      if (flat >= total) return;
+      const int64_t m = flat / K;
+      const int64_t k = flat % K;
+      const int64_t tile_k = k / kBlockLen;
+      const float lhs_scale = lhs_scale_inv[tile_k * scale_stride + m];
+      const float rhs_scale = rhs_scale_inv[tile_k * scale_stride + m];
+      const float lhs = fp8_byte_to_float(lhs_data[flat]) * lhs_scale;
+      const float rhs = fp8_byte_to_float(rhs_data[flat]) * rhs_scale;
+      const float go = grad_out[flat];
+      grad_lhs[flat] = go * rhs;
+      grad_rhs[flat] = go * lhs;
+    }
+    }  // namespace
+
+    std::vector<torch::Tensor> fused_sigmoid_gate_fp8_forward(
+        torch::Tensor proj_data,
+        torch::Tensor proj_scale_inv,
+        torch::Tensor gate_data,
+        torch::Tensor gate_scale_inv,
+        torch::Tensor mask) {
+      TORCH_CHECK(proj_data.is_cuda(), "proj_data must be CUDA");
+      TORCH_CHECK(gate_data.is_cuda(), "gate_data must be CUDA");
+      auto proj_data_c = proj_data.contiguous();
+      auto gate_data_c = gate_data.contiguous();
+      auto proj_scale_c = proj_scale_inv.contiguous();
+      auto gate_scale_c = gate_scale_inv.contiguous();
+      auto mask_c = mask.defined() && mask.numel() > 0 ? mask.contiguous() : torch::Tensor();
+      const int64_t K = proj_data_c.size(-1);
+      const int64_t M = proj_data_c.numel() / K;
+      auto out_data = torch::empty_like(proj_data_c);
+      auto out_scale = torch::empty_like(proj_scale_c);
+      auto saved_g_data = torch::empty_like(proj_data_c);
+      auto saved_g_scale = torch::empty_like(proj_scale_c);
+      const dim3 grid((K + kBlockLen - 1) / kBlockLen, (M + kBlockLen - 1) / kBlockLen);
+      const dim3 block(256);
+      fused_sigmoid_gate_fp8_fwd_kernel<<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
+          proj_data_c.data_ptr<uint8_t>(),
+          proj_scale_c.data_ptr<float>(),
+          gate_data_c.data_ptr<uint8_t>(),
+          gate_scale_c.data_ptr<float>(),
+          mask_c.defined() && mask_c.numel() > 0 ? mask_c.data_ptr<float>() : nullptr,
+          out_data.data_ptr<uint8_t>(),
+          out_scale.data_ptr<float>(),
+          saved_g_data.data_ptr<uint8_t>(),
+          saved_g_scale.data_ptr<float>(),
+          M,
+          K,
+          proj_scale_c.size(1));
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return {out_data, out_scale, saved_g_data, saved_g_scale};
+    }
+
+    std::vector<torch::Tensor> fused_sigmoid_gate_fp8_backward(
+        torch::Tensor proj_data,
+        torch::Tensor proj_scale_inv,
+        torch::Tensor saved_g_data,
+        torch::Tensor saved_g_scale_inv,
+        torch::Tensor grad_out,
+        torch::Tensor mask) {
+      TORCH_CHECK(proj_data.is_cuda(), "proj_data must be CUDA");
+      auto proj_data_c = proj_data.contiguous();
+      auto proj_scale_c = proj_scale_inv.contiguous();
+      auto saved_g_data_c = saved_g_data.contiguous();
+      auto saved_g_scale_c = saved_g_scale_inv.contiguous();
+      auto grad_out_c = grad_out.contiguous();
+      auto mask_c = mask.defined() && mask.numel() > 0 ? mask.contiguous() : torch::Tensor();
+      const int64_t K = proj_data_c.size(-1);
+      const int64_t M = proj_data_c.numel() / K;
+      auto grad_proj = torch::empty_like(grad_out_c, grad_out_c.options().dtype(torch::kFloat32));
+      auto grad_gate = torch::empty_like(grad_out_c, grad_out_c.options().dtype(torch::kFloat32));
+      const int threads = 256;
+      const int blocks = (M * K + threads - 1) / threads;
+      fused_sigmoid_gate_fp8_bwd_kernel<<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
+          proj_data_c.data_ptr<uint8_t>(),
+          proj_scale_c.data_ptr<float>(),
+          saved_g_data_c.data_ptr<uint8_t>(),
+          saved_g_scale_c.data_ptr<float>(),
+          grad_out_c.data_ptr<float>(),
+          mask_c.defined() && mask_c.numel() > 0 ? mask_c.data_ptr<float>() : nullptr,
+          grad_proj.data_ptr<float>(),
+          grad_gate.data_ptr<float>(),
+          M,
+          K,
+          proj_scale_c.size(1));
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return {grad_proj, grad_gate};
+    }
+
+    std::vector<torch::Tensor> fused_relu_fp8_forward(
+        torch::Tensor rowwise_data,
+        torch::Tensor columnwise_data) {
+      TORCH_CHECK(rowwise_data.is_cuda(), "rowwise_data must be CUDA");
+      auto rowwise_in = rowwise_data.contiguous();
+      auto rowwise_out = torch::empty_like(rowwise_in);
+      const int threads = 256;
+      const int blocks = (rowwise_in.numel() + threads - 1) / threads;
+      fused_relu_fp8_fwd_kernel<<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
+          rowwise_in.data_ptr<uint8_t>(),
+          rowwise_out.data_ptr<uint8_t>(),
+          rowwise_in.numel());
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+      torch::Tensor columnwise_out;
+      if (columnwise_data.defined() && columnwise_data.numel() > 0) {
+        auto columnwise_in = columnwise_data.contiguous();
+        columnwise_out = torch::empty_like(columnwise_in);
+        const int col_blocks = (columnwise_in.numel() + threads - 1) / threads;
+        fused_relu_fp8_fwd_kernel<<<col_blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
+            columnwise_in.data_ptr<uint8_t>(),
+            columnwise_out.data_ptr<uint8_t>(),
+            columnwise_in.numel());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+      } else {
+        columnwise_out = torch::Tensor();
+      }
+      return {rowwise_out, columnwise_out};
+    }
+
+    torch::Tensor fused_relu_fp8_backward(
+        torch::Tensor saved_rowwise_data,
+        torch::Tensor grad_out) {
+      TORCH_CHECK(saved_rowwise_data.is_cuda(), "saved_rowwise_data must be CUDA");
+      auto saved_rowwise = saved_rowwise_data.contiguous();
+      auto grad_out_c = grad_out.contiguous();
+      auto grad_input = torch::empty_like(grad_out_c, grad_out_c.options().dtype(torch::kFloat32));
+      const int threads = 256;
+      const int blocks = (saved_rowwise.numel() + threads - 1) / threads;
+      fused_relu_fp8_bwd_kernel<<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
+          saved_rowwise.data_ptr<uint8_t>(),
+          grad_out_c.data_ptr<float>(),
+          grad_input.data_ptr<float>(),
+          saved_rowwise.numel());
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return grad_input;
+    }
+
+    torch::Tensor fused_sigmoid_fp8_backward(
+        torch::Tensor saved_out_data,
+        torch::Tensor saved_out_scale_inv,
+        torch::Tensor grad_out) {
+      TORCH_CHECK(saved_out_data.is_cuda(), "saved_out_data must be CUDA");
+      auto saved_data_c = saved_out_data.contiguous();
+      auto saved_scale_c = saved_out_scale_inv.contiguous();
+      auto grad_out_c = grad_out.contiguous();
+      const int64_t K = saved_data_c.size(-1);
+      const int64_t M = saved_data_c.numel() / K;
+      auto grad_input = torch::empty_like(grad_out_c, grad_out_c.options().dtype(torch::kFloat32));
+      const int threads = 256;
+      const int blocks = (M * K + threads - 1) / threads;
+      fused_sigmoid_fp8_bwd_kernel<<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
+          saved_data_c.data_ptr<uint8_t>(),
+          saved_scale_c.data_ptr<float>(),
+          grad_out_c.data_ptr<float>(),
+          grad_input.data_ptr<float>(),
+          M,
+          K,
+          saved_scale_c.size(1));
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return grad_input;
+    }
+
+    std::vector<torch::Tensor> fused_mul_fp8_backward(
+        torch::Tensor lhs_data,
+        torch::Tensor lhs_scale_inv,
+        torch::Tensor rhs_data,
+        torch::Tensor rhs_scale_inv,
+        torch::Tensor grad_out) {
+      TORCH_CHECK(lhs_data.is_cuda(), "lhs_data must be CUDA");
+      auto lhs_data_c = lhs_data.contiguous();
+      auto lhs_scale_c = lhs_scale_inv.contiguous();
+      auto rhs_data_c = rhs_data.contiguous();
+      auto rhs_scale_c = rhs_scale_inv.contiguous();
+      auto grad_out_c = grad_out.contiguous();
+      const int64_t K = lhs_data_c.size(-1);
+      const int64_t M = lhs_data_c.numel() / K;
+      auto grad_lhs = torch::empty_like(grad_out_c, grad_out_c.options().dtype(torch::kFloat32));
+      auto grad_rhs = torch::empty_like(grad_out_c, grad_out_c.options().dtype(torch::kFloat32));
+      const int threads = 256;
+      const int blocks = (M * K + threads - 1) / threads;
+      fused_mul_fp8_bwd_kernel<<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
+          lhs_data_c.data_ptr<uint8_t>(),
+          lhs_scale_c.data_ptr<float>(),
+          rhs_data_c.data_ptr<uint8_t>(),
+          rhs_scale_c.data_ptr<float>(),
+          grad_out_c.data_ptr<float>(),
+          grad_lhs.data_ptr<float>(),
+          grad_rhs.data_ptr<float>(),
+          M,
+          K,
+          lhs_scale_c.size(1));
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return {grad_lhs, grad_rhs};
+    }
+    """
+
+    _FUSED_ELEMENTWISE_MODULE = load_inline(
+        name=module_name,
+        cpp_sources=[cpp_source],
+        cuda_sources=[cuda_source],
+        functions=[
+            "fused_sigmoid_gate_fp8_forward",
+            "fused_sigmoid_gate_fp8_backward",
+            "fused_sigmoid_fp8_backward",
+            "fused_relu_fp8_forward",
+            "fused_relu_fp8_backward",
+            "fused_mul_fp8_backward",
+        ],
+        extra_cuda_cflags=["-O3"],
+        with_cuda=True,
+        verbose=False,
+    )
+    return _FUSED_ELEMENTWISE_MODULE
+
+
+def fused_sigmoid_gate_forward_fp8(
+    proj: "Float8BlockwiseQTensor",
+    gate: "Float8BlockwiseQTensor",
+    mask: Optional[torch.Tensor] = None,
+    *,
+    preserve_columnwise_output: bool = True,
+) -> tuple["Float8BlockwiseQTensor", "Float8BlockwiseQTensor"]:
+    """Fused forward for proj * sigmoid(gate), returning output and saved sigmoid state."""
+    if (
+        not isinstance(proj, Float8BlockwiseQTensor)
+        or not isinstance(gate, Float8BlockwiseQTensor)
+        or proj._rowwise_data is None
+        or proj._rowwise_scale_inv is None
+        or gate._rowwise_data is None
+        or gate._rowwise_scale_inv is None
+        or not proj._is_2D_scaled
+        or not gate._is_2D_scaled
+        or proj._fp8_dtype != TE_DType.kFloat8E4M3
+        or gate._fp8_dtype != TE_DType.kFloat8E4M3
+    ):
+        raise RuntimeError("fused_sigmoid_gate_forward_fp8 requires rowwise 2D-scaled E4M3 Float8BlockwiseQTensor")
+
+    mod = _get_fused_elementwise_module()
+    mask_flat = (
+        mask.contiguous().view(-1).to(device=proj.device, dtype=torch.float32)
+        if mask is not None
+        else torch.empty(0, device=proj.device, dtype=torch.float32)
+    )
+    out_rowwise_data, out_rowwise_scale_inv, g_rowwise_data, g_rowwise_scale_inv = mod.fused_sigmoid_gate_fp8_forward(
+        proj._rowwise_data,
+        proj._rowwise_scale_inv,
+        gate._rowwise_data,
+        gate._rowwise_scale_inv,
+        mask_flat,
+    )
+    out_quantizer = proj._get_quantizer().copy()
+    out_quantizer.set_usage(rowwise=True, columnwise=preserve_columnwise_output)
+    out_q = Float8BlockwiseQTensor(
+        shape=proj.shape,
+        dtype=proj.dtype,
+        fp8_dtype=proj._fp8_dtype,
+        rowwise_data=out_rowwise_data,
+        rowwise_scale_inv=out_rowwise_scale_inv,
+        columnwise_data=None,
+        columnwise_scale_inv=None,
+        quantizer=out_quantizer,
+        is_2D_scaled=True,
+        requires_grad=proj.requires_grad or gate.requires_grad,
+    )
+    if preserve_columnwise_output:
+        out_q.update_usage(rowwise_usage=True, columnwise_usage=True)
+
+    g_quantizer = gate._get_quantizer().copy()
+    g_quantizer.set_usage(rowwise=True, columnwise=False)
+    g_q = Float8BlockwiseQTensor(
+        shape=gate.shape,
+        dtype=gate.dtype,
+        fp8_dtype=gate._fp8_dtype,
+        rowwise_data=g_rowwise_data,
+        rowwise_scale_inv=g_rowwise_scale_inv,
+        columnwise_data=None,
+        columnwise_scale_inv=None,
+        quantizer=g_quantizer,
+        is_2D_scaled=True,
+        requires_grad=False,
+    )
+    return out_q, g_q
+
+
+def fused_sigmoid_gate_backward_fp8(
+    proj: "Float8BlockwiseQTensor",
+    saved_g: "Float8BlockwiseQTensor",
+    grad_out: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    *,
+    proj_dtype: Optional[torch.dtype] = None,
+    gate_dtype: Optional[torch.dtype] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused backward for proj * sigmoid(gate) using saved FP8 sigmoid output."""
+    if isinstance(grad_out, QuantizedTensor):
+        grad_out = grad_out.dequantize(dtype=proj_dtype or gate_dtype or proj.dtype)
+    target_dtype = proj_dtype or gate_dtype or proj.dtype
+    grad_out_f = grad_out.contiguous().to(dtype=torch.float32)
+    mask_flat = (
+        mask.contiguous().view(-1).to(device=proj.device, dtype=torch.float32)
+        if mask is not None
+        else torch.empty(0, device=proj.device, dtype=torch.float32)
+    )
+    mod = _get_fused_elementwise_module()
+    grad_proj, grad_gate = mod.fused_sigmoid_gate_fp8_backward(
+        proj._rowwise_data,
+        proj._rowwise_scale_inv,
+        saved_g._rowwise_data,
+        saved_g._rowwise_scale_inv,
+        grad_out_f,
+        mask_flat,
+    )
+    if proj_dtype is not None:
+        grad_proj = grad_proj.to(proj_dtype)
+    if gate_dtype is not None:
+        grad_gate = grad_gate.to(gate_dtype)
+    elif target_dtype is not None:
+        grad_gate = grad_gate.to(target_dtype)
+    return grad_proj, grad_gate
+
+
+def fused_relu_forward_fp8(
+    tensor: "Float8BlockwiseQTensor",
+) -> "Float8BlockwiseQTensor":
+    """Fused raw-FP8 ReLU forward, preserving scales and layout copies."""
+    if (
+        not isinstance(tensor, Float8BlockwiseQTensor)
+        or tensor._rowwise_data is None
+        or tensor._rowwise_scale_inv is None
+    ):
+        raise RuntimeError("fused_relu_forward_fp8 requires rowwise Float8BlockwiseQTensor")
+    mod = _get_fused_elementwise_module()
+    columnwise_data = (
+        tensor._columnwise_data
+        if tensor._columnwise_data is not None
+        else torch.empty(0, device=tensor.device, dtype=torch.uint8)
+    )
+    rowwise_out, columnwise_out = mod.fused_relu_fp8_forward(tensor._rowwise_data, columnwise_data)
+    out_q = Float8BlockwiseQTensor(
+        shape=tensor.shape,
+        dtype=tensor.dtype,
+        fp8_dtype=tensor._fp8_dtype,
+        rowwise_data=rowwise_out,
+        rowwise_scale_inv=tensor._rowwise_scale_inv.detach().clone(),
+        columnwise_data=columnwise_out if columnwise_out.numel() > 0 else None,
+        columnwise_scale_inv=(
+            tensor._columnwise_scale_inv.detach().clone()
+            if tensor._columnwise_scale_inv is not None
+            else None
+        ),
+        quantizer=tensor._quantizer,
+        is_2D_scaled=tensor._is_2D_scaled,
+        requires_grad=tensor.requires_grad,
+    )
+    if out_q._columnwise_data is None and tensor._columnwise_data is not None:
+        out_q.update_usage(rowwise_usage=True, columnwise_usage=True)
+    return out_q
+
+
+def fused_relu_backward_fp8(
+    saved_rowwise_data: torch.Tensor,
+    grad_out: torch.Tensor,
+    *,
+    input_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Fused raw-FP8 ReLU backward from saved rowwise bytes."""
+    if isinstance(grad_out, QuantizedTensor):
+        grad_out = grad_out.dequantize(dtype=input_dtype)
+    grad_out_f = grad_out.contiguous().to(dtype=torch.float32)
+    mod = _get_fused_elementwise_module()
+    grad_input = mod.fused_relu_fp8_backward(saved_rowwise_data, grad_out_f)
+    if input_dtype is not None and grad_input.dtype != input_dtype:
+        grad_input = grad_input.to(input_dtype)
+    return grad_input
 
 
 class Float8BlockQuantizer(Quantizer):

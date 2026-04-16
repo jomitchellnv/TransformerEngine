@@ -394,15 +394,6 @@ class Float8BlockScaling(Recipe):
         assert self.x_block_scaling_dim in [1, 2], "Only 1D or 2D blocks supported for x"
         assert self.w_block_scaling_dim in [1, 2], "Only 1D or 2D blocks supported for w"
         assert self.grad_block_scaling_dim in [1, 2], "Only 1D or 2D blocks supported for grad"
-        assert not (
-            self.x_block_scaling_dim == 2 and self.w_block_scaling_dim == 2
-        ), "2D by 2D block gemm not supported."
-        assert not (
-            self.x_block_scaling_dim == 2 and self.grad_block_scaling_dim == 2
-        ), "2D by 2D block gemm not supported."
-        assert not (
-            self.w_block_scaling_dim == 2 and self.grad_block_scaling_dim == 2
-        ), "2D by 2D block gemm not supported."
         assert self.fp8_gemm_fprop.use_split_accumulator, "Split accumulator required for fprop."
         assert self.fp8_gemm_dgrad.use_split_accumulator, "Split accumulator required for dgrad."
         assert self.fp8_gemm_wgrad.use_split_accumulator, "Split accumulator required for wgrad."

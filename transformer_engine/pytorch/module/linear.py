@@ -414,6 +414,11 @@ class _Linear(torch.autograd.Function):
                 ):
                     # All-gather is not supported with FP8 column-wise data
                     inputmat.update_usage(rowwise_usage=True, columnwise_usage=False)
+                elif getattr(inputmat, "_is_2D_scaled", False):
+                    # For 2D block-scaled FP8, columnwise data can be derived lazily
+                    # from rowwise data during backward. Keep only the rowwise copy
+                    # here to reduce saved activation footprint.
+                    inputmat.update_usage(rowwise_usage=True, columnwise_usage=False)
                 else:
                     # Discard row-wise data since it is not needed in backward pass
                     inputmat.update_usage(rowwise_usage=False, columnwise_usage=True)

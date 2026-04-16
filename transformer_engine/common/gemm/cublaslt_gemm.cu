@@ -575,12 +575,6 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
                  "FP8 block scaling requires cuBLAS 12.9+, but run-time cuBLAS version is ",
                  transformer_engine::cuda::cublas_version());
 
-      // Check that matrix formats are valid
-      NVTE_CHECK((!(inputA->scaling_mode == NVTE_BLOCK_SCALING_2D &&
-                    inputB->scaling_mode == NVTE_BLOCK_SCALING_2D)),
-                 "Only 1D by 1D, 1D by 2D, and 2D by 1D block scaling GEMM is supported, "
-                 "but got 2D by 2D");
-
       // Configure cuBLAS scales
       float *A_scale_inverse = reinterpret_cast<float *>(param.A_scale_inv);
       float *B_scale_inverse = reinterpret_cast<float *>(param.B_scale_inv);
